@@ -109,9 +109,29 @@ int g_aud_to_host_fill_level;
 
 int aud_data_remaining_to_device = 0;
 
+#ifdef XSCOPE
+#include <xscope.h>
+#define XUA_PROBE_UNDERFLOW()  xscope_int(0, ++g_outUnderflowCount)
+#define XUA_PROBE_OVERFLOW()   xscope_int(1, ++g_outOverflowCount)
+#define XUA_PROBE_FILL(v)      xscope_int(2, (unsigned)(v))
+#else
+#define XUA_PROBE_UNDERFLOW()  (g_outUnderflowCount++)
+#define XUA_PROBE_OVERFLOW()   (g_outOverflowCount++)
+#define XUA_PROBE_FILL(v)      ((void)(v))
+#endif
+
 /* Audio over/under flow flags */
 unsigned outUnderflow = 1;
 unsigned outOverflow = 0;
+
+/* Instrumentation: how often the OUT buffer has actually run dry or filled up.
+ * The flags above are state, not events, so they cannot answer "how often".
+ * xscope_int() writes to a hardware-buffered probe rather than doing I/O, so
+ * it is safe in this real-time path in a way debug_printf would not be --
+ * printing from here would perturb the very timing being measured. */
+unsigned g_outUnderflowCount = 0;
+unsigned g_outOverflowCount = 0;
+unsigned g_fillProbeDiv = 0;
 unsigned inUnderflow = 1;
 
 int aud_req_in_count = 0;
@@ -833,6 +853,7 @@ void XUA_Buffer_Decouple(chanend c_mix_out
 #if (NUM_USB_CHAN_OUT > 0)
                     /* Reset OUT buffer state */
                     outUnderflow = 1;
+                    XUA_PROBE_UNDERFLOW();
                     SET_SHARED_GLOBAL(g_aud_from_host_rdptr, aud_from_host_fifo_start);
                     SET_SHARED_GLOBAL(g_aud_from_host_wrptr, aud_from_host_fifo_start);
                     SET_SHARED_GLOBAL(aud_data_remaining_to_device, 0);
@@ -923,6 +944,7 @@ void XUA_Buffer_Decouple(chanend c_mix_out
                 unpackState = 0;
 
                 outUnderflow = 1;
+                XUA_PROBE_UNDERFLOW();
                 if(outOverflow)
                 {
                     /* If we were previously in overflow we wont have marked as ready */
@@ -1019,6 +1041,17 @@ void XUA_Buffer_Decouple(chanend c_mix_out
                 space_left = aud_from_host_fifo_end - g_aud_from_host_wrptr;
             }
 
+            /* Instrumentation: free space in the OUT FIFO, every 10th packet
+             * (100 Hz). This is the device's own view of whether the host is
+             * over- or under-feeding, and unlike the over/underflow flags it
+             * is continuous -- drift shows up long before it forces a
+             * correction. Costs one compare in the per-frame path. */
+            if(++g_fillProbeDiv >= 10)
+            {
+                g_fillProbeDiv = 0;
+                XUA_PROBE_FILL(space_left);
+            }
+
 #if (XUD_USB_ISO_MAX_TXNS_PER_MICROFRAME > 1)
             if (space_left <= 0 || space_left >= REQD_BUF_SIZE_ERR_HANDLING_HIBW_OUT)
 #else
@@ -1032,6 +1065,7 @@ void XUA_Buffer_Decouple(chanend c_mix_out
             {
                 /* Enter OUT over flow state */
                 outOverflow = 1;
+                XUA_PROBE_OVERFLOW();
 
 #ifdef DEBUG_LEDS
                 led(c_led);

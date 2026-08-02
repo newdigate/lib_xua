@@ -245,7 +245,12 @@ void thread_speed()
 #ifdef XSCOPE
 void xscope_user_init()
 {
-    xscope_register(0, 0, "", 0, "");
+    /* Two probes for the OUT decoupler buffer. Named so `xrun --xscope`
+     * output identifies them without cross-referencing probe ids. */
+    xscope_register(3,
+                    XSCOPE_CONTINUOUS, "out_underflow", XSCOPE_UINT, "count",
+                    XSCOPE_CONTINUOUS, "out_overflow",  XSCOPE_UINT, "count",
+                    XSCOPE_CONTINUOUS, "out_fifo_free", XSCOPE_UINT, "bytes");
 
     xscope_config_io(XSCOPE_IO_BASIC);
 }
