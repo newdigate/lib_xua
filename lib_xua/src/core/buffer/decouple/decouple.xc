@@ -114,10 +114,12 @@ int aud_data_remaining_to_device = 0;
 #define XUA_PROBE_UNDERFLOW()  xscope_int(0, ++g_outUnderflowCount)
 #define XUA_PROBE_OVERFLOW()   xscope_int(1, ++g_outOverflowCount)
 #define XUA_PROBE_FILL(v)      xscope_int(2, (unsigned)(v))
+#define XUA_PROBE_DRYOUT()     xscope_int(3, g_outDryoutCount)
 #else
 #define XUA_PROBE_UNDERFLOW()  (g_outUnderflowCount++)
 #define XUA_PROBE_OVERFLOW()   (g_outOverflowCount++)
 #define XUA_PROBE_FILL(v)      ((void)(v))
+#define XUA_PROBE_DRYOUT()     ((void)0)
 #endif
 
 /* Audio over/under flow flags */
@@ -132,6 +134,15 @@ unsigned outOverflow = 0;
 unsigned g_outUnderflowCount = 0;
 unsigned g_outOverflowCount = 0;
 unsigned g_fillProbeDiv = 0;
+
+/* Runtime dry-outs of the OUT FIFO, distinct from g_outUnderflowCount: the
+ * literal `outUnderflow = 1` sites are stream-reset points, but the FIFO can
+ * also run dry mid-stream via the computed assignment in
+ * handle_audio_request(). That path executes at interrupt level feeding I2S,
+ * so it must not call xscope itself; it increments this counter and the
+ * decoupler emits the value from its own context at the fill-probe cadence.
+ * Single writer (the interrupt side), single reader -- no atomicity needed. */
+unsigned g_outDryoutCount = 0;
 unsigned inUnderflow = 1;
 
 int aud_req_in_count = 0;
@@ -646,6 +657,15 @@ __builtin_unreachable();
 
             g_aud_from_host_rdptr+=4;
         }
+        else
+        {
+            /* Instrumentation: the FIFO ran dry mid-stream. From here the
+             * device plays OUT_BUFFER_PREFILL bytes of silence before
+             * resuming -- an audible gap. Counter only: this runs at
+             * interrupt level, so the xscope emission happens in the
+             * decoupler loop, not here. */
+            g_outDryoutCount++;
+        }
     }
 }
 
@@ -1041,15 +1061,31 @@ void XUA_Buffer_Decouple(chanend c_mix_out
                 space_left = aud_from_host_fifo_end - g_aud_from_host_wrptr;
             }
 
-            /* Instrumentation: free space in the OUT FIFO, every 10th packet
+            /* Instrumentation: OUT FIFO fill in bytes, every 10th packet
              * (100 Hz). This is the device's own view of whether the host is
              * over- or under-feeding, and unlike the over/underflow flags it
              * is continuous -- drift shows up long before it forces a
-             * correction. Costs one compare in the per-frame path. */
+             * correction.
+             *
+             * Deliberately NOT space_left: that is a pointer difference
+             * carrying a special case that flips its meaning as the ring
+             * wraps, and a drift fit over it produced a slope of 0.222 where
+             * calibrated arithmetic demands 1.000. Fill is the plain
+             * occupancy (wrptr - rdptr) wrapped into the buffer size. rdptr
+             * was sampled at entry, so the value is noisy by up to one packet
+             * of concurrent consumption -- harmless for a fit over seconds.
+             *
+             * The dry-out count rides along at the same cadence: it is
+             * incremented at interrupt level in handle_audio_request(), where
+             * an xscope call would not be safe, and only emitted here. */
             if(++g_fillProbeDiv >= 10)
             {
                 g_fillProbeDiv = 0;
-                XUA_PROBE_FILL(space_left);
+                int fill_bytes = aud_from_host_wrptr - aud_from_host_rdptr;
+                if (fill_bytes < 0)
+                    fill_bytes += BUFF_SIZE_OUT;
+                XUA_PROBE_FILL(fill_bytes);
+                XUA_PROBE_DRYOUT();
             }
 
 #if (XUD_USB_ISO_MAX_TXNS_PER_MICROFRAME > 1)

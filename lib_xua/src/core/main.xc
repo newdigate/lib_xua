@@ -245,12 +245,16 @@ void thread_speed()
 #ifdef XSCOPE
 void xscope_user_init()
 {
-    /* Two probes for the OUT decoupler buffer. Named so `xrun --xscope`
-     * output identifies them without cross-referencing probe ids. */
-    xscope_register(3,
+    /* Probes for the OUT decoupler buffer. Named so `xrun --xscope`
+     * output identifies them without cross-referencing probe ids. Order
+     * defines the ids (0..3) hardcoded in decouple.xc -- append only.
+     * out_fifo_fill replaced out_fifo_free: the free-space value carried a
+     * wrap special case that made drift fits meaningless. */
+    xscope_register(4,
                     XSCOPE_CONTINUOUS, "out_underflow", XSCOPE_UINT, "count",
                     XSCOPE_CONTINUOUS, "out_overflow",  XSCOPE_UINT, "count",
-                    XSCOPE_CONTINUOUS, "out_fifo_free", XSCOPE_UINT, "bytes");
+                    XSCOPE_CONTINUOUS, "out_fifo_fill", XSCOPE_UINT, "bytes",
+                    XSCOPE_CONTINUOUS, "out_dryout",    XSCOPE_UINT, "count");
 
     xscope_config_io(XSCOPE_IO_BASIC);
 }
