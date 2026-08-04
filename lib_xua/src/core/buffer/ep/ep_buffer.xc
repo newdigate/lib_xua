@@ -772,6 +772,16 @@ void XUA_Buffer_Ep(
                             {
                                 fb_clocks[0] = clocks >> 2;
                             }
+
+                            /* Validator: same mirror as the variable-frequency
+                             * branch above. Both are needed -- the first
+                             * silicon run reported fb_value stuck at 0 for a
+                             * whole capture because only that branch was
+                             * hooked and this fixed-frequency build takes
+                             * this one. A counter that is wired to a path the
+                             * build does not execute reads exactly like a
+                             * device with nothing to say. */
+                            SET_SHARED_GLOBAL(g_uacvFbValue, fb_clocks[0]);
                         }
 #ifdef FB_TOLERANCE_TEST
                         else

@@ -157,6 +157,7 @@ unsigned g_uacvPktNotMultiple = 0;      /* word 4  */
 unsigned g_uacvHistSize[8] = {0,0,0,0,0,0,0,0};   /* words 20..27 */
 unsigned g_uacvHistCount[8] = {0,0,0,0,0,0,0,0};  /* words 28..35 */
 unsigned g_uacvHistOverflow = 0;        /* word 19 */
+unsigned g_uacvBlockDiv = 0;            /* block cadence divider */
 
 /* Byte-lane occupancy. or_acc says which bit positions were EVER set, and_acc
  * which were ALWAYS set. Together they identify subslot justification without
@@ -1321,12 +1322,30 @@ void XUA_Buffer_Decouple(chanend c_mix_out
             if(++g_fillProbeDiv >= 10)
             {
                 g_fillProbeDiv = 0;
+                /* Block cadence is a tenth of the fill cadence. At high speed
+                 * the OUT endpoint is released once per 125 us MICROFRAME, so
+                 * the fill probe runs at ~800 Hz, not the ~100 Hz a
+                 * frame-rate assumption predicts -- and 37 words at 800 Hz is
+                 * ~30,000 xscope events/s, which measurably dropped data on
+                 * the first silicon run (10 missing marks, 158 MB capture,
+                 * report correctly INVALID).
+                 *
+                 * The block carries counters, not a waveform, so a tenth of
+                 * the rate costs nothing any rule cares about: the coarsest
+                 * consumer asks whether packets arrived during alt 0, not
+                 * exactly when the switch happened. The fill probe itself
+                 * keeps its own cadence, because that one IS a waveform and
+                 * the drift fit needs the points. */
+                if(++g_uacvBlockDiv >= 10)
+                {
+                    g_uacvBlockDiv = 0;
+                    uacvEmitBlock();
+                }
                 int fill_bytes = aud_from_host_wrptr - aud_from_host_rdptr;
                 if (fill_bytes < 0)
                     fill_bytes += BUFF_SIZE_OUT;
                 XUA_PROBE_FILL(fill_bytes);
                 XUA_PROBE_DRYOUT();
-                uacvEmitBlock();
             }
 
 #if (XUD_USB_ISO_MAX_TXNS_PER_MICROFRAME > 1)
