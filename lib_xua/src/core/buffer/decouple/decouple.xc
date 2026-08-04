@@ -574,6 +574,19 @@ __builtin_unreachable();
                     }
                     unpackState++;
 
+                    /* Validator: the 3-byte subslot path needs the same
+                     * byte-lane accumulation as the 4-byte and 16-bit ones.
+                     * Omitting it did not read as "no data" -- it read as
+                     * or_acc == 0, which is the signature of a SILENT stream,
+                     * and R3's left-justification test would have returned
+                     * PASS from a path that never ran. macOS picked this
+                     * format on the very first UAC1 capture; only the
+                     * non-silent-frame witness stopped the false PASS. */
+                    g_uacvOrAcc |= (unsigned)sample;
+                    g_uacvAndAcc &= (unsigned)sample;
+                    if(sample) g_uacvFrameNonzero = 1;
+                    uacvCheckSample((unsigned)sample);
+
 #if (OUTPUT_VOLUME_CONTROL == 1) && (!OUT_VOLUME_IN_MIXER)
                     unsafe
                     {
