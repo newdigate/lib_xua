@@ -143,6 +143,36 @@ unsigned g_fillProbeDiv = 0;
  * decoupler emits the value from its own context at the fill-probe cadence.
  * Single writer (the interrupt side), single reader -- no atomicity needed. */
 unsigned g_outDryoutCount = 0;
+
+/* UAC host-validator reductions. The device reduces; it never judges -- there
+ * are no thresholds, no verdicts and no spec clauses anywhere in this file.
+ * Field meanings are normative in docs/uac-validator-wire-format.md in the
+ * evkb repo; the word indices below refer to that table.
+ *
+ * Single writer (this core) except where noted, single reader (the emission
+ * at the fill cadence). */
+unsigned g_uacvPktCount = 0;            /* word 2  */
+unsigned g_uacvPktShortDiscarded = 0;   /* word 3  */
+unsigned g_uacvPktNotMultiple = 0;      /* word 4  */
+unsigned g_uacvHistSize[8] = {0,0,0,0,0,0,0,0};   /* words 20..27 */
+unsigned g_uacvHistCount[8] = {0,0,0,0,0,0,0,0};  /* words 28..35 */
+unsigned g_uacvHistOverflow = 0;        /* word 19 */
+
+/* Byte-lane occupancy. or_acc says which bit positions were EVER set, and_acc
+ * which were ALWAYS set. Together they identify subslot justification without
+ * knowing anything about the audio content:
+ *   (or_acc & 0xFF) == 0              -> low byte never used -> left-justified
+ *   (or_acc >> 24) == (and_acc >> 24) -> top byte constant   -> right-justified
+ *
+ * nonsilent_frames is the vacuity witness. On a silent stream or_acc stays 0
+ * and the justification test would pass for the WRONG REASON, declaring a
+ * right-justifying host conformant. The judge refuses to rule without enough
+ * non-silent frames. */
+unsigned g_uacvOrAcc = 0;               /* word 5  */
+unsigned g_uacvAndAcc = 0xFFFFFFFF;     /* word 6  */
+unsigned g_uacvNonsilentFrames = 0;     /* word 7  */
+unsigned g_uacvFrameNonzero = 0;        /* per-frame latch, not emitted */
+
 unsigned inUnderflow = 1;
 
 int aud_req_in_count = 0;
@@ -161,11 +191,43 @@ unsigned g_input_stream_active = 0;
 unsigned g_any_stream_active_old = 0;
 unsigned g_any_stream_active_current = 0;
 
+/* Record one observed packet size. Eight slots is generous: a conformant host
+ * uses at most two distinct sizes, the fractional-sample floor and ceiling. A
+ * host needing more than eight is itself a finding, which is why the overflow
+ * is counted rather than silently folded into a neighbouring slot -- the judge
+ * refuses to rule on packet size at all while any packet went unaccounted. */
+static inline void uacvRecordSize(unsigned size)
+{
+    for(int i = 0; i < 8; i++)
+    {
+        if(g_uacvHistSize[i] == size)
+        {
+            g_uacvHistCount[i]++;
+            return;
+        }
+        if(g_uacvHistSize[i] == 0)
+        {
+            g_uacvHistSize[i] = size;
+            g_uacvHistCount[i] = 1;
+            return;
+        }
+    }
+    g_uacvHistOverflow++;
+}
+
 static inline void _send_sample_4(chanend c_mix_out, int ch)
 {
     int sample;
     read_via_xc_ptr(sample, g_aud_from_host_rdptr);
     g_aud_from_host_rdptr+=4;
+
+    /* Validator: accumulate byte-lane occupancy before anything downstream can
+     * normalise it away. This is the ONLY place the raw subslot bytes exist --
+     * the 3-byte path masks with 0xffffff00, and UserBufferManagement runs on
+     * the other tile, after unpacking. Two ALU ops per sample. */
+    g_uacvOrAcc |= (unsigned)sample;
+    g_uacvAndAcc &= (unsigned)sample;
+    if(sample) g_uacvFrameNonzero = 1;
 
 #if (OUTPUT_VOLUME_CONTROL == 1) && (!OUT_VOLUME_IN_MIXER)
     int mult;
@@ -237,6 +299,18 @@ void handle_audio_request(chanend c_mix_out)
     /* Input word that triggered interrupt and handshake back */
     unsigned underflowSample = inuint(c_mix_out);
 
+    /* Validator: this function emits exactly one audio frame per call, so
+     * latching at entry counts the frame the PREVIOUS call assembled. Counting
+     * frames rather than samples is what makes the witness comparable across
+     * channel counts -- and it is a witness, not a metric: the judge refuses to
+     * rule on subslot justification until enough non-silent frames have gone
+     * by, because a silent stream would pass that test for the wrong reason. */
+    if(g_uacvFrameNonzero)
+    {
+        g_uacvNonsilentFrames++;
+        g_uacvFrameNonzero = 0;
+    }
+
     // OUT
 #if (NUM_USB_CHAN_OUT == 0)
     outuint(c_mix_out, underflowSample);
@@ -286,6 +360,15 @@ __builtin_unreachable();
                     read_short_via_xc_ptr(sample, g_aud_from_host_rdptr);
                     g_aud_from_host_rdptr+=2;
                     sample <<= 16;
+
+                    /* Validator: same byte-lane accumulation as the 24-in-4
+                     * path. A 2-byte subslot has no spare lane, so the judge
+                     * SKIPs the justification rule here -- but the vacuity
+                     * witness still has to be counted, or a UAC1 capture could
+                     * not tell silence from signal either. */
+                    g_uacvOrAcc |= (unsigned)sample;
+                    g_uacvAndAcc &= (unsigned)sample;
+                    if(sample) g_uacvFrameNonzero = 1;
 
 #if (OUTPUT_VOLUME_CONTROL == 1) && (!OUT_VOLUME_IN_MIXER)
                     unsafe
@@ -1039,6 +1122,16 @@ void XUA_Buffer_Decouple(chanend c_mix_out
             /* Ignore bad small packets */
             if((datalength >= (g_numUsbChan_Out * g_curSubSlot_Out)) && (released_buffer == aud_from_host_wrptr))
             {
+                /* Validator: this packet was accepted. Record its size, and
+                 * whether it is a whole number of audio frames -- lib_xua
+                 * tolerates a non-multiple silently (see the tail handling in
+                 * handle_audio_request, whose comment names a bad driver),
+                 * which is exactly the kind of quiet tolerance this tool
+                 * exists to make audible. */
+                g_uacvPktCount++;
+                uacvRecordSize((unsigned)datalength);
+                if(datalength % (g_numUsbChan_Out * g_curSubSlot_Out))
+                    g_uacvPktNotMultiple++;
 
                 /* Move the write pointer of the fifo on - round up to nearest word */
                 aud_from_host_wrptr = aud_from_host_wrptr + ((datalength+3)&~0x3) + 4;
@@ -1049,6 +1142,12 @@ void XUA_Buffer_Decouple(chanend c_mix_out
                     aud_from_host_wrptr = aud_from_host_fifo_start;
                 }
                 SET_SHARED_GLOBAL(g_aud_from_host_wrptr, aud_from_host_wrptr);
+            }
+            else if(datalength < (g_numUsbChan_Out * g_curSubSlot_Out))
+            {
+                /* Validator: shorter than one audio frame. lib_xua discards
+                 * these silently -- count them so the judge can say so. */
+                g_uacvPktShortDiscarded++;
             }
 
             /* if we have enough space left then send a new buffer pointer
