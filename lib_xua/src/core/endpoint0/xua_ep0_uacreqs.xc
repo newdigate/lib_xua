@@ -7,6 +7,13 @@
 
 #include "xua.h"
 
+/* Owned by xua_endpoint0.c; same tile, single writer, read by the decoupler's
+ * block emission. Declared here so the clock-request hook below can set it. */
+extern unsigned g_uacvClassReqBitmap;
+#define UACV_REQ_CLOCK_SET_CUR   (1u << 0)
+#define UACV_REQ_CLOCK_GET_CUR   (1u << 1)
+
+
 #if XUA_USB_EN
 #include <xs1.h>
 #include "xud_device.h"
@@ -333,6 +340,23 @@ int AudioClassRequests_2(XUD_ep ep0_out, XUD_ep ep0_in, USB_SetupPacket_t &sp, c
                         /* Sample Frequency control */
                         case CS_SAM_FREQ_CONTROL:
                         {
+                            /* Validator: record that the host addressed the
+                             * clock at all. Set on first arrival and never
+                             * cleared -- an incomplete configuration sequence
+                             * asks "did the host ever do this", not "how
+                             * often". Hooked at the Clock Source unit's sample
+                             * frequency control specifically, because that is
+                             * the request a host must issue to select a rate;
+                             * a host that claims the device and never gets
+                             * here is the fourth defect this tool was built
+                             * for, and it is reportable only as a metric since
+                             * nothing in the spec obliges a host to configure
+                             * a device it has claimed. */
+                            if(sp.bmRequestType.Direction == USB_BM_REQTYPE_DIRECTION_H2D)
+                                g_uacvClassReqBitmap |= UACV_REQ_CLOCK_SET_CUR;
+                            else
+                                g_uacvClassReqBitmap |= UACV_REQ_CLOCK_GET_CUR;
+
                             /* Direction: Host-to-device */
                             if(sp.bmRequestType.Direction == USB_BM_REQTYPE_DIRECTION_H2D)
                             {
