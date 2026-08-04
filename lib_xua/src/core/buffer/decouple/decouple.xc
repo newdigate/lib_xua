@@ -173,6 +173,91 @@ unsigned g_uacvAndAcc = 0xFFFFFFFF;     /* word 6  */
 unsigned g_uacvNonsilentFrames = 0;     /* word 7  */
 unsigned g_uacvFrameNonzero = 0;        /* per-frame latch, not emitted */
 
+/* Cooperative mode: the host plays a known LFSR sequence and every sample is
+ * checked against it. Compiled out entirely unless UACV_COOPERATIVE=1, so the
+ * default passive build pays nothing in the real-time path.
+ *
+ * pat_sync_count is NOT pat_resync_count. A resync is giving up and hunting
+ * again, after 8 consecutive mismatches; a sync is a successful lock. A host
+ * whose playback path is not bit-exact accumulates resyncs while its sync
+ * count barely moves, and that difference is the only thing separating "never
+ * locked" (not bit-exact) from "locked once then lost samples" (real packet
+ * loss). Collapse them into one increment and the judge goes back to accusing
+ * conformant hosts of dropping packets. */
+unsigned g_uacvPatErrCount = 0;         /* word 14 */
+unsigned g_uacvPatResyncCount = 0;      /* word 15 */
+unsigned g_uacvPatFirstErrIdx = 0;      /* word 16 */
+unsigned g_uacvPatFirstExpected = 0;    /* word 17 */
+unsigned g_uacvPatFirstActual = 0;      /* word 18 */
+unsigned g_uacvPatSyncCount = 0;        /* word 36 */
+
+/* Owned by ep_buffer.xc and xua_endpoint0.c. All three live on
+ * XUA_XUD_TILE_NUM, so plain shared globals are sound: one writer each, and
+ * this file's emission is the only reader. */
+extern unsigned g_uacvFbPollCount;
+extern unsigned g_uacvFbValue;
+extern unsigned g_uacvAltOut;
+extern unsigned g_uacvAltTransitions;
+extern unsigned g_uacvClassReqBitmap;
+extern unsigned g_uacvHostActive;
+
+#if (UACV_COOPERATIVE == 1)
+#define UACV_LFSR_SEED    0xACE1u
+#define UACV_RESYNC_AFTER 8
+static unsigned g_uacvLfsr = UACV_LFSR_SEED;
+static unsigned g_uacvPatSynced = 0;
+static unsigned g_uacvPatRun = 0;       /* consecutive mismatches */
+static unsigned g_uacvSampleIdx = 0;
+
+/* Galois LFSR, left-justified into the subslot so it survives the same packing
+ * the audio does. The host generates the identical sequence. */
+static inline unsigned uacvNextExpected(void)
+{
+    unsigned lsb = g_uacvLfsr & 1u;
+    g_uacvLfsr >>= 1;
+    if(lsb) g_uacvLfsr ^= 0xB4BCD35Cu;
+    return g_uacvLfsr << 8;
+}
+
+static inline void uacvCheckSample(unsigned s)
+{
+    unsigned expected;
+    g_uacvSampleIdx++;
+    if(!g_uacvPatSynced)
+    {
+        if((s & 0xFFFFFF00u) == ((UACV_LFSR_SEED << 8) & 0xFFFFFF00u))
+        {
+            g_uacvLfsr = UACV_LFSR_SEED;
+            g_uacvPatSynced = 1;
+            g_uacvPatRun = 0;
+            g_uacvPatSyncCount++;
+        }
+        return;
+    }
+    expected = uacvNextExpected();
+    if((s & 0xFFFFFF00u) == (expected & 0xFFFFFF00u))
+    {
+        g_uacvPatRun = 0;
+        return;
+    }
+    g_uacvPatErrCount++;
+    if(g_uacvPatFirstErrIdx == 0)
+    {
+        g_uacvPatFirstErrIdx   = g_uacvSampleIdx;
+        g_uacvPatFirstExpected = expected;
+        g_uacvPatFirstActual   = s;
+    }
+    if(++g_uacvPatRun >= UACV_RESYNC_AFTER)
+    {
+        g_uacvPatSynced = 0;
+        g_uacvPatRun = 0;
+        g_uacvPatResyncCount++;
+    }
+}
+#else
+static inline void uacvCheckSample(unsigned s) { (void)s; }
+#endif
+
 unsigned inUnderflow = 1;
 
 int aud_req_in_count = 0;
@@ -215,6 +300,60 @@ static inline void uacvRecordSize(unsigned size)
     g_uacvHistOverflow++;
 }
 
+#ifdef XSCOPE
+#define UACV_MAGIC   0x55414356  /* 'UACV' */
+#define UACV_VERSION 1
+#define UACV_WORDS   37
+#define UACV_PROBE_BASE 4
+
+/* Emit the whole state block. All 37 words every time, deliberately: it makes
+ * each block self-contained, and it keeps the judge's repeated-word-index
+ * grouping exact -- the judge reassembles a block by watching for word 0 to
+ * come round again, since consecutive xscope_int() calls do not share a VCD
+ * timestamp (measured at ~180 ns apart, so a block spans ~6.7 us against a
+ * 10 ms period).
+ *
+ * SCALAR rather than xscope_bytes(): a bench spike showed byte-probe payloads
+ * land inside VCD $comment blocks, which every standard parser skips and every
+ * waveform viewer ignores. Scalar probes stay a real VCD you can open and
+ * look at.
+ *
+ * Probe names must match the judge's uacv_wNN exactly -- it resolves signals
+ * by name, never by probe id. */
+static inline void uacvEmitBlock(void)
+{
+    unsigned w[UACV_WORDS];
+    w[0]  = UACV_MAGIC;              w[1]  = UACV_VERSION;
+    w[2]  = g_uacvPktCount;          w[3]  = g_uacvPktShortDiscarded;
+    w[4]  = g_uacvPktNotMultiple;    w[5]  = g_uacvOrAcc;
+    w[6]  = g_uacvAndAcc;            w[7]  = g_uacvNonsilentFrames;
+    /* These six are written by the EP-buffer and EP0 cores. XC forbids a plain
+     * shared mutable global across parallel tasks, so read them through the
+     * same dp-relative accessors the rest of this file already uses for
+     * cross-task state. */
+    GET_SHARED_GLOBAL(w[8],  g_uacvFbPollCount);
+    GET_SHARED_GLOBAL(w[9],  g_uacvFbValue);
+    GET_SHARED_GLOBAL(w[10], g_uacvAltOut);
+    GET_SHARED_GLOBAL(w[11], g_uacvAltTransitions);
+    GET_SHARED_GLOBAL(w[12], g_uacvClassReqBitmap);
+    GET_SHARED_GLOBAL(w[13], g_uacvHostActive);
+    w[14] = g_uacvPatErrCount;       w[15] = g_uacvPatResyncCount;
+    w[16] = g_uacvPatFirstErrIdx;    w[17] = g_uacvPatFirstExpected;
+    w[18] = g_uacvPatFirstActual;    w[19] = g_uacvHistOverflow;
+    for(int i = 0; i < 8; i++)
+    {
+        w[20 + i] = g_uacvHistSize[i];
+        w[28 + i] = g_uacvHistCount[i];
+    }
+    w[36] = g_uacvPatSyncCount;
+
+    for(int i = 0; i < UACV_WORDS; i++)
+        xscope_int(UACV_PROBE_BASE + i, w[i]);
+}
+#else
+static inline void uacvEmitBlock(void) {}
+#endif
+
 static inline void _send_sample_4(chanend c_mix_out, int ch)
 {
     int sample;
@@ -228,6 +367,7 @@ static inline void _send_sample_4(chanend c_mix_out, int ch)
     g_uacvOrAcc |= (unsigned)sample;
     g_uacvAndAcc &= (unsigned)sample;
     if(sample) g_uacvFrameNonzero = 1;
+    uacvCheckSample((unsigned)sample);
 
 #if (OUTPUT_VOLUME_CONTROL == 1) && (!OUT_VOLUME_IN_MIXER)
     int mult;
@@ -369,6 +509,7 @@ __builtin_unreachable();
                     g_uacvOrAcc |= (unsigned)sample;
                     g_uacvAndAcc &= (unsigned)sample;
                     if(sample) g_uacvFrameNonzero = 1;
+                    uacvCheckSample((unsigned)sample);
 
 #if (OUTPUT_VOLUME_CONTROL == 1) && (!OUT_VOLUME_IN_MIXER)
                     unsafe
@@ -1185,6 +1326,7 @@ void XUA_Buffer_Decouple(chanend c_mix_out
                     fill_bytes += BUFF_SIZE_OUT;
                 XUA_PROBE_FILL(fill_bytes);
                 XUA_PROBE_DRYOUT();
+                uacvEmitBlock();
             }
 
 #if (XUD_USB_ISO_MAX_TXNS_PER_MICROFRAME > 1)

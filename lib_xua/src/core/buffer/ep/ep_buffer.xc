@@ -711,7 +711,7 @@ void XUA_Buffer_Ep(
                              * branches above scale differently, and guessing
                              * the encoding would print a confident wrong
                              * sample rate. */
-                            g_uacvFbValue = (fb_clocks, unsigned[])[0];
+                            SET_SHARED_GLOBAL(g_uacvFbValue, (fb_clocks, unsigned[])[0]);
                         }
                         clockcounter = 0;
                     }
@@ -812,7 +812,11 @@ void XUA_Buffer_Ep(
                  * is reading. This counter is the whole evidence for the
                  * defect that started the investigation, and it is visible
                  * nowhere else in the system. */
-                g_uacvFbPollCount++;
+                {
+                    unsigned n;
+                    GET_SHARED_GLOBAL(n, g_uacvFbPollCount);
+                    SET_SHARED_GLOBAL(g_uacvFbPollCount, n + 1);
+                }
 
                 GET_SHARED_GLOBAL(busSpeed, g_curUsbSpeed);
 

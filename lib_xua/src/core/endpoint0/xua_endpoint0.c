@@ -599,7 +599,11 @@ void XUA_Endpoint0_loop(XUD_Result_t result, USB_SetupPacket_t sp, chanend c_ep0
                     /* Validator: set on first arrival, never cleared. The
                      * question a stalled configuration sequence poses is "did
                      * the host ever do this", not "how often". */
-                    g_uacvClassReqBitmap |= UACV_REQ_SET_INTERFACE;
+                    {
+                        unsigned m;
+                        GET_SHARED_GLOBAL(m, g_uacvClassReqBitmap);
+                        SET_SHARED_GLOBAL(g_uacvClassReqBitmap, m | UACV_REQ_SET_INTERFACE);
+                    }
                     switch (sp.wIndex)
                     {
                         /* Check for audio stream from host start/stop */
@@ -617,8 +621,12 @@ void XUA_Endpoint0_loop(XUD_Result_t result, USB_SetupPacket_t sp, chanend c_ep0
                                     {
                                         assert((c_aud_ctl != null) && msg("Format change not supported when c_aud_ctl is null"));
                                         g_curStreamAlt_Out = newStreamAlt_Out;
-                                        g_uacvAltOut = newStreamAlt_Out;
-                                        g_uacvAltTransitions++;
+                                        {
+                                            unsigned n;
+                                            SET_SHARED_GLOBAL(g_uacvAltOut, newStreamAlt_Out);
+                                            GET_SHARED_GLOBAL(n, g_uacvAltTransitions);
+                                            SET_SHARED_GLOBAL(g_uacvAltTransitions, n + 1);
+                                        }
 
                                         /* Send format of data onto buffering */
                                         if(g_curStreamAlt_Out > 0)
@@ -765,7 +773,7 @@ void XUA_Endpoint0_loop(XUD_Result_t result, USB_SetupPacket_t sp, chanend c_ep0
                         {
                             dfu_usb_set_configured_state();
                             /* Consider host active with valid driver at this point */
-                            g_uacvHostActive = 1; UserHostActive(1);
+                            SET_SHARED_GLOBAL(g_uacvHostActive, 1); UserHostActive(1);
                         }
 
                         /* We want to run USB_StandardsRequests() implementation also. Don't modify result
@@ -1166,7 +1174,7 @@ void XUA_Endpoint0_loop(XUD_Result_t result, USB_SetupPacket_t sp, chanend c_ep0
             if(g_currentConfig)
             {
                 dfu_usb_clear_configured_state();
-                g_uacvHostActive = 0; UserHostActive(0);
+                SET_SHARED_GLOBAL(g_uacvHostActive, 0); UserHostActive(0);
                 g_currentConfig = 0;
             }
 
@@ -1205,7 +1213,7 @@ void XUA_Endpoint0_loop(XUD_Result_t result, USB_SetupPacket_t sp, chanend c_ep0
                 /* Device moving from CONFIGURED to SUSPENDED state */
                 if(g_currentConfig)
                 {
-                    g_uacvHostActive = 0; UserHostActive(0);
+                    SET_SHARED_GLOBAL(g_uacvHostActive, 0); UserHostActive(0);
                 }
 
                 // Perform user-defined suspend behaviour
@@ -1222,7 +1230,7 @@ void XUA_Endpoint0_loop(XUD_Result_t result, USB_SetupPacket_t sp, chanend c_ep0
 
                 /* Device moving from SUSPENDED to CONFIGURED state - call user call back */
                 if(g_currentConfig == 1)
-                    g_uacvHostActive = 1; UserHostActive(1);
+                    SET_SHARED_GLOBAL(g_uacvHostActive, 1); UserHostActive(1);
             }
             /* Acknowledge back to XUD letting it know we've handled suspend/resume */
             XUD_AckBusState(ep0_out, &ep0_in); // This should set ep_info[i]

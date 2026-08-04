@@ -7,8 +7,10 @@
 
 #include "xua.h"
 
-/* Owned by xua_endpoint0.c; same tile, single writer, read by the decoupler's
- * block emission. Declared here so the clock-request hook below can set it. */
+/* Owned by xua_endpoint0.c; same tile, read by the decoupler's block emission.
+ * XC forbids a plain shared mutable global across parallel tasks, so this is
+ * accessed through the dp-relative accessors in xc_ptr.h. */
+#include "xc_ptr.h"
 extern unsigned g_uacvClassReqBitmap;
 #define UACV_REQ_CLOCK_SET_CUR   (1u << 0)
 #define UACV_REQ_CLOCK_GET_CUR   (1u << 1)
@@ -352,10 +354,15 @@ int AudioClassRequests_2(XUD_ep ep0_out, XUD_ep ep0_in, USB_SetupPacket_t &sp, c
                              * for, and it is reportable only as a metric since
                              * nothing in the spec obliges a host to configure
                              * a device it has claimed. */
-                            if(sp.bmRequestType.Direction == USB_BM_REQTYPE_DIRECTION_H2D)
-                                g_uacvClassReqBitmap |= UACV_REQ_CLOCK_SET_CUR;
-                            else
-                                g_uacvClassReqBitmap |= UACV_REQ_CLOCK_GET_CUR;
+                            {
+                                unsigned m;
+                                GET_SHARED_GLOBAL(m, g_uacvClassReqBitmap);
+                                if(sp.bmRequestType.Direction == USB_BM_REQTYPE_DIRECTION_H2D)
+                                    m |= UACV_REQ_CLOCK_SET_CUR;
+                                else
+                                    m |= UACV_REQ_CLOCK_GET_CUR;
+                                SET_SHARED_GLOBAL(g_uacvClassReqBitmap, m);
+                            }
 
                             /* Direction: Host-to-device */
                             if(sp.bmRequestType.Direction == USB_BM_REQTYPE_DIRECTION_H2D)
