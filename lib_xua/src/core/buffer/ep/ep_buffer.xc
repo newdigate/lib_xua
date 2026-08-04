@@ -37,6 +37,13 @@ unsigned g_speed = (XUA_USB_BUS_SPEED == 2) ? (DEFAULT_FREQ/8000) << 16 : (DEFAU
 unsigned g_streamChangeOngoing = 0; /* Not cleared until audio has completed it's SR change. This can be used for logic that needs to know audio has completed the command */
 unsigned g_feedbackValid = 0;
 
+/* UAC host-validator reductions owned by this core. Emitted by the decoupler
+ * at the fill cadence; both live on XUA_XUD_TILE_NUM so a plain shared global
+ * is sound, single writer to single reader. See
+ * docs/uac-validator-wire-format.md in the evkb repo for word meanings. */
+unsigned g_uacvFbPollCount = 0;   /* word 8 */
+unsigned g_uacvFbValue = 0;       /* word 9 */
+
 #if (XUA_SPDIF_RX_EN || XUA_ADAT_RX_EN)
 /* When digital Rx enabled we enable an interrupt EP to inform host about changes in clock validity */
 /* Interrupt EP report data */
@@ -695,6 +702,16 @@ void XUA_Buffer_Ep(
                             {
                                 (fb_clocks, unsigned[])[0] = clocks >> 2;
                             }
+
+                            /* Validator: mirror what this device is ASKING the
+                             * host for, so the judge can compare the request
+                             * against what the host actually sent. That turns
+                             * servo quality from an inference into a
+                             * measurement. Published raw: the FS and HS
+                             * branches above scale differently, and guessing
+                             * the encoding would print a confident wrong
+                             * sample rate. */
+                            g_uacvFbValue = (fb_clocks, unsigned[])[0];
                         }
                         clockcounter = 0;
                     }
@@ -787,6 +804,15 @@ void XUA_Buffer_Ep(
             case XUD_SetData_Select(c_aud_fb, ep_aud_fb, result):
             {
                 XUD_BusSpeed_t busSpeed;
+
+                /* Validator: the host completed an IN on the feedback
+                 * endpoint. Counting COMPLETIONS rather than arms is
+                 * deliberate -- an endpoint this device armed and the host
+                 * never read must not be indistinguishable from one the host
+                 * is reading. This counter is the whole evidence for the
+                 * defect that started the investigation, and it is visible
+                 * nowhere else in the system. */
+                g_uacvFbPollCount++;
 
                 GET_SHARED_GLOBAL(busSpeed, g_curUsbSpeed);
 
