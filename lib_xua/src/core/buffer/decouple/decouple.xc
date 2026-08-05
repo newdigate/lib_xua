@@ -157,7 +157,6 @@ unsigned g_uacvPktNotMultiple = 0;      /* word 4  */
 unsigned g_uacvHistSize[8] = {0,0,0,0,0,0,0,0};   /* words 20..27 */
 unsigned g_uacvHistCount[8] = {0,0,0,0,0,0,0,0};  /* words 28..35 */
 unsigned g_uacvHistOverflow = 0;        /* word 19 */
-unsigned g_uacvBlockDiv = 0;            /* block cadence divider */
 
 /* Byte-lane occupancy. or_acc says which bit positions were EVER set, and_acc
  * which were ALWAYS set. Together they identify subslot justification without
@@ -306,6 +305,17 @@ static inline void uacvRecordSize(unsigned size)
 #define UACV_VERSION 1
 #define UACV_WORDS   37
 #define UACV_PROBE_BASE 4
+
+/* 100 Hz, in 100 MHz reference ticks. Event-rate arithmetic, because this is
+ * the budget that has bitten before: 37 words at 100 Hz is 3,700 xscope
+ * events/s, on top of the fill probe's two events at ~800 Hz high-speed =
+ * 1,600. About 5,300/s total, against the ~30,000/s that measurably dropped
+ * data (10 missing marks) on the first silicon run. It is also LOWER than
+ * the previous high-speed block rate implied (8000 packets/s / 10 / 10 = 80
+ * Hz emitted 2,960 events/s only while traffic flowed); the difference is
+ * that this rate is now constant and traffic-independent, which is the whole
+ * point. */
+#define UACV_EMIT_TICKS (100000000 / 100)
 
 /* Emit the whole state block. All 37 words every time, deliberately: it makes
  * each block self-contained, and it keeps the judge's repeated-word-index
@@ -981,6 +991,25 @@ void XUA_Buffer_Decouple(chanend c_mix_out
     int aud_to_host_flag = 0;
 #endif
 
+    /* Validator state-block emission clock. The block is a set of COUNTERS,
+     * so it must be sampled on wall-clock time rather than on packet
+     * arrival: a host that claims the device and then transmits nothing is a
+     * real and interesting finding, and if emission rides on packets that
+     * host produces a capture with zero blocks -- indistinguishable, to the
+     * judge, from a collector that died. It reported INVALID and could not
+     * attribute the defect (corpus case E, 2026-08-05).
+     *
+     * This loop is a free-running poll loop -- XUA_CHAN_BUFF_CTRL is opt-in
+     * and off here, so nothing blocks it -- which is why a polled timer in
+     * this task ticks even with the bus idle, and why the block can stay
+     * where its counters live instead of being read across tasks. */
+#ifdef XSCOPE
+    timer uacvEmitTmr;
+    unsigned uacvNextEmit;
+    uacvEmitTmr :> uacvNextEmit;
+    uacvNextEmit += UACV_EMIT_TICKS;
+#endif
+
     int t = array_to_xc_ptr(outAudioBuff);
 
     aud_from_host_fifo_start = t;
@@ -1077,6 +1106,23 @@ void XUA_Buffer_Decouple(chanend c_mix_out
 #endif
         {
             asm("#decouple-default");
+
+#ifdef XSCOPE
+            /* Emit on the clock, not on traffic. Re-based on `now` rather
+             * than advanced by a period, so a loop stalled longer than one
+             * interval resumes at the next tick instead of firing a burst of
+             * catch-up blocks into an xscope link that is already the
+             * bottleneck. Counters do not care about the jitter. */
+            {
+                unsigned uacvNow;
+                uacvEmitTmr :> uacvNow;
+                if((int)(uacvNow - uacvNextEmit) >= 0)
+                {
+                    uacvNextEmit = uacvNow + UACV_EMIT_TICKS;
+                    uacvEmitBlock();
+                }
+            }
+#endif
 
             /* Check for freq change or other update */
 
@@ -1335,25 +1381,10 @@ void XUA_Buffer_Decouple(chanend c_mix_out
             if(++g_fillProbeDiv >= 10)
             {
                 g_fillProbeDiv = 0;
-                /* Block cadence is a tenth of the fill cadence. At high speed
-                 * the OUT endpoint is released once per 125 us MICROFRAME, so
-                 * the fill probe runs at ~800 Hz, not the ~100 Hz a
-                 * frame-rate assumption predicts -- and 37 words at 800 Hz is
-                 * ~30,000 xscope events/s, which measurably dropped data on
-                 * the first silicon run (10 missing marks, 158 MB capture,
-                 * report correctly INVALID).
-                 *
-                 * The block carries counters, not a waveform, so a tenth of
-                 * the rate costs nothing any rule cares about: the coarsest
-                 * consumer asks whether packets arrived during alt 0, not
-                 * exactly when the switch happened. The fill probe itself
-                 * keeps its own cadence, because that one IS a waveform and
-                 * the drift fit needs the points. */
-                if(++g_uacvBlockDiv >= 10)
-                {
-                    g_uacvBlockDiv = 0;
-                    uacvEmitBlock();
-                }
+                /* The fill probe stays packet-driven, unlike the state
+                 * block: this one IS a waveform and the drift fit needs its
+                 * points where the packets are. A capture with no packets has
+                 * no fill trace, and W1/W3 correctly SKIP for want of one. */
                 int fill_bytes = aud_from_host_wrptr - aud_from_host_rdptr;
                 if (fill_bytes < 0)
                     fill_bytes += BUFF_SIZE_OUT;
